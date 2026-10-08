@@ -335,26 +335,45 @@ async def scan_live_candidates(c: Client, args):
     now_ms = int(time.time() * 1000)
     end_ms = now_ms // HOUR_MS * HOUR_MS
 
-    # 전 종목 프리미엄 및 펀딩비 1회 일괄 조회
-    symbols_task = get_symbols(c)
+    # 1. 24hr 티커 및 프리미엄 인덱스 1회 일괄 조회 (525개 klines 호출로 인한 418 IP 차단 원천 방지)
+    tickers_task = c.get("/fapi/v1/ticker/24hr")
     prem_task = c.get("/fapi/v1/premiumIndex")
-    symbols, prem_list = await asyncio.gather(symbols_task, prem_task)
+    ticker_list, prem_list = await asyncio.gather(tickers_task, prem_task)
 
+    # 24h 거래대금 하한 기준(args.live_min_vol)으로 대상 심볼 사전 필터링 (약 30~40개로 압축)
+    vol_cutoff = args.live_min_vol * 0.90
+    target_symbols = []
+    for t in ticker_list:
+        sym = t.get("symbol", "")
+        if sym.endswith("USDT"):
+            try:
+                qv = float(t.get("quoteVolume", 0))
+                if qv >= vol_cutoff:
+                    target_symbols.append(sym)
+            except (ValueError, TypeError):
+                continue
+
+    if not target_symbols:
+        all_syms = await get_symbols(c)
+        target_symbols = all_syms
+
+    target_set = set(target_symbols)
     prem_map = {}
     for p in prem_list:
         sym = p.get("symbol")
-        try:
-            m_p = float(p.get("markPrice", 0))
-            i_p = float(p.get("indexPrice", 0))
-            f_r = float(p.get("lastFundingRate", 0))
-            prem = (m_p / i_p - 1.0) if i_p > 0 else None
-            prem_map[sym] = {"prem": prem, "fund": f_r, "mark": m_p}
-        except (ValueError, TypeError):
-            continue
+        if sym in target_set:
+            try:
+                m_p = float(p.get("markPrice", 0))
+                i_p = float(p.get("indexPrice", 0))
+                f_r = float(p.get("lastFundingRate", 0))
+                prem = (m_p / i_p - 1.0) if i_p > 0 else None
+                prem_map[sym] = {"prem": prem, "fund": f_r, "mark": m_p}
+            except (ValueError, TypeError):
+                continue
 
-    # 1차 필터링
+    # 2. 선별된 대상 종목에 대해서만 정밀 klines 조회 (요청 수 525개 -> 30여개로 90% 이상 절감)
     candidates = await asyncio.gather(*(
-        live_symbol(c, s, end_ms, now_ms, prem_map, args) for s in symbols))
+        live_symbol(c, s, end_ms, now_ms, prem_map, args) for s in target_symbols))
     candidates = [cand for cand in candidates if cand is not None]
 
     # 1차 통과 종목 대상 OI 변화율 조회
