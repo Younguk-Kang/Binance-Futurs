@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: binance-pump-alert-bot
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SCAN_INTERVAL_MIN
+        value: "15"
+      - key: MIN_SCORE_NOTIFY
+        value: "3.0"
+      - key: COOLDOWN_HOURS
+        value: "4.0"
+      - key: PORT
+        value: "10000"
