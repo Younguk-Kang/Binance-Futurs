@@ -43,6 +43,12 @@ OI_LIMIT_MS = 30 * 24 * HOUR_MS
 CONCURRENCY = 10            # 안전한 동시 요청 수
 
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
 class Client:
     def __init__(self, session: aiohttp.ClientSession, concurrency: int):
         self.s = session
@@ -53,6 +59,7 @@ class Client:
             async with self.sem:
                 try:
                     async with self.s.get(BASE + path, params=params,
+                                          headers=DEFAULT_HEADERS,
                                           timeout=aiohttp.ClientTimeout(total=30)) as r:
                         # 1분 누적 가중치 헤더 감지 및 선제적 백오프
                         used_weight = r.headers.get("x-mbx-used-weight-1m")
@@ -67,9 +74,22 @@ class Client:
                                 pass
 
                         if r.status in (429, 418):
+                            body_text = await r.text()
                             retry_after = int(r.headers.get("Retry-After", 0))
                             wait = max(retry_after, 30 * (attempt + 1))
-                            print(f"\n[rate-limit] HTTP {r.status} on {path}. Cooling down {wait}s...")
+                            
+                            # 418 밴 잔여 시간 파싱 (예: banned until 1791493196751)
+                            if "banned until" in body_text:
+                                import re
+                                m = re.search(r"banned until (\d+)", body_text)
+                                if m:
+                                    ban_until_ms = int(m.group(1))
+                                    now_ms = int(time.time() * 1000)
+                                    rem_sec = max(5, int((ban_until_ms - now_ms) / 1000) + 2)
+                                    print(f"\n[rate-limit] 바이낸스 IP 임시 차단 감지 (해제까지 {rem_sec//60}분 {rem_sec%60}초 남음). 대기합니다...", flush=True)
+                                    wait = rem_sec
+
+                            print(f"\n[rate-limit] HTTP {r.status} on {path}. Cooling down {wait}s...", flush=True)
                             await asyncio.sleep(wait)
                             continue
                         if r.status >= 500:
