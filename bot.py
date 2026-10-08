@@ -4,12 +4,14 @@
 - 15분(또는 설정된 주기)마다 바이낸스 USDT-M 무기한 선물 전체를 스캔
 - Kamps & Kleinberg (2018), Xu & Livshits (2019), He et al. (2022) 기반 종합 점수 산출
 - 상위 감지 종목을 텔레그램 봇으로 즉시 알림
-- Render.com 무료 Web Service 호환용 Health Check 웹서버 내장
+- Render.com 무료 Web Service 호환용 Health Check 웹서버 & 실시간 디버그 엔드포인트 내장
 """
 import argparse
 import asyncio
 import os
+import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import aiohttp
@@ -25,22 +27,31 @@ MIN_SCORE_NOTIFY = float(os.getenv("MIN_SCORE_NOTIFY", "3.0"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4.0"))
 PORT = int(os.getenv("PORT", "10000"))
 
-# 상태 관리 (중복 알림 방지용 캐시)
-# symbol -> {"last_time": timestamp, "score": float, "price": float}
+# 상태 관리 (중복 알림 방지용 캐시 및 실시간 상태)
 alert_cache = {}
 bot_state = {
     "start_time": time.time(),
     "last_scan_time": None,
     "last_scan_count": 0,
     "total_alerts_sent": 0,
+    "stage": "initializing",
+    "scan_in_progress": False,
+    "last_error": None,
+    "last_error_time": None,
+    "last_detected": [],
 }
+
+
+def log(msg: str):
+    """실시간 stdout 출력 (버퍼링 방지)."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{now}] {msg}", flush=True)
 
 
 async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
     """텔레그램 메시지 발송."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] 토큰 또는 CHAT_ID가 설정되지 않아 콘솔 출력으로 대체합니다.")
-        print(text)
+        log("[telegram] 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -57,9 +68,9 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
                 if r.status == 200:
                     return True
                 res = await r.text()
-                print(f"[telegram error] status={r.status}: {res}")
+                log(f"[telegram error] status={r.status}: {res}")
         except Exception as ex:
-            print(f"[telegram fail] attempt {attempt+1}: {ex}")
+            log(f"[telegram fail] attempt {attempt+1}: {ex}")
         await asyncio.sleep(2 ** attempt)
     return False
 
@@ -132,24 +143,34 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
 
 async def run_single_scan(session: aiohttp.ClientSession, args):
     """1회 실시간 스캔 및 알림 발송."""
+    if bot_state["scan_in_progress"]:
+        log("이미 다른 스캔이 진행 중입니다. 건너뜁니다.")
+        return
+
+    bot_state["scan_in_progress"] = True
+    bot_state["stage"] = "scanning"
     c = Client(session, args.concurrency)
     t0 = time.time()
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now_str}] 실시간 스캔 시작 ...")
+    log("실시간 스캔 시작 ...")
 
     try:
         candidates, last_closed_ms = await scan_live_candidates(c, args)
         as_of_str = datetime.fromtimestamp(last_closed_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
         scan_sec = time.time() - t0
-        print(f"[{now_str}] 스캔 완료 ({scan_sec:.1f}초, 후보 {len(candidates)}개 감지)")
+        log(f"스캔 완료 ({scan_sec:.1f}초, 후보 {len(candidates)}개 감지)")
 
         bot_state["last_scan_time"] = time.time()
         bot_state["last_scan_count"] = len(candidates)
+        bot_state["last_detected"] = [
+            {"symbol": cand["symbol"], "score": round(cand["score"], 1), "price": cand["price"]}
+            for cand in candidates[:5]
+        ]
+        bot_state["stage"] = "evaluating_alerts"
 
         alerts_to_send = [c for c in candidates if should_alert(c)]
 
         if alerts_to_send:
-            print(f"[{now_str}] 신규 알림 대상 {len(alerts_to_send)}개 발송 시작 ...")
+            log(f"신규 알림 대상 {len(alerts_to_send)}개 발송 시작 ...")
             for item in alerts_to_send:
                 text = format_alert_message(item, as_of_str)
                 success = await send_telegram(session, text)
@@ -157,10 +178,20 @@ async def run_single_scan(session: aiohttp.ClientSession, args):
                     bot_state["total_alerts_sent"] += 1
                 await asyncio.sleep(0.5)  # 텔레그램 초당 발송 제한 방지
         else:
-            print(f"[{now_str}] 새로운 알림 대상 없음 (모두 쿨다운 또는 점수 미달)")
+            log("새로운 알림 대상 없음 (모두 쿨다운 또는 점수 미달)")
+
+        bot_state["stage"] = "idle"
 
     except Exception as ex:
-        print(f"[{now_str}] [오류 발생] 스캔 루프 예외: {ex}")
+        err_msg = f"{type(ex).__name__}: {ex}"
+        bot_state["last_error"] = err_msg
+        bot_state["last_error_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        bot_state["stage"] = "error"
+        log(f"[오류 발생] 스캔 루프 예외: {err_msg}")
+        traceback.print_exc()
+
+    finally:
+        bot_state["scan_in_progress"] = False
 
 
 async def scheduler_loop(args):
@@ -180,11 +211,11 @@ async def scheduler_loop(args):
         while True:
             await run_single_scan(session, args)
             sleep_sec = max(60, SCAN_INTERVAL_MIN * 60)
-            print(f"[scheduler] 다음 스캔까지 {sleep_sec // 60}분간 대기합니다 ...\n")
+            log(f"[scheduler] 다음 스캔까지 {sleep_sec // 60}분간 대기합니다 ...\n")
             await asyncio.sleep(sleep_sec)
 
 
-# ---------------------------------------------------------------- Render 웹서버 (Healthcheck)
+# ---------------------------------------------------------------- Render 웹서버 & 디버그 라우트
 async def handle_index(request):
     uptime = int(time.time() - bot_state["start_time"])
     last_scan = (
@@ -196,21 +227,74 @@ async def handle_index(request):
         "status": "ok",
         "service": "binance-early-warning-bot",
         "uptime_seconds": uptime,
+        "stage": bot_state["stage"],
+        "scan_in_progress": bot_state["scan_in_progress"],
         "last_scan_time": last_scan,
         "last_scan_count": bot_state["last_scan_count"],
         "total_alerts_sent": bot_state["total_alerts_sent"],
+        "last_detected": bot_state["last_detected"],
+        "last_error": bot_state["last_error"],
+        "last_error_time": bot_state["last_error_time"],
         "active_cache_symbols": list(alert_cache.keys()),
     }
     return web.json_response(data)
+
+
+async def handle_debug(request):
+    """Render 서버의 외부 IP 및 바이낸스 통신 상태 즉시 진단."""
+    diag = {}
+    async with aiohttp.ClientSession() as s:
+        # 1. 서버 외부 IP 확인
+        try:
+            async with s.get("https://api.ipify.org?format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                diag["server_ip"] = (await r.json()).get("ip")
+        except Exception as e:
+            diag["server_ip_error"] = str(e)
+
+        # 2. 바이낸스 핑 테스트
+        try:
+            async with s.get("https://fapi.binance.com/fapi/v1/ping", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                diag["binance_ping_status"] = r.status
+                diag["binance_weight_1m"] = r.headers.get("x-mbx-used-weight-1m")
+        except Exception as e:
+            diag["binance_ping_error"] = str(e)
+
+        # 3. 바이낸스 1h 캔들 테스트 (BTCUSDT)
+        try:
+            async with s.get("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=5",
+                             timeout=aiohttp.ClientTimeout(total=5)) as r:
+                diag["binance_klines_status"] = r.status
+                if r.status != 200:
+                    diag["binance_klines_response"] = await r.text()
+        except Exception as e:
+            diag["binance_klines_error"] = str(e)
+
+    diag["bot_state"] = bot_state
+    return web.json_response(diag)
+
+
+async def handle_manual_scan(request):
+    """웹 브라우저 접속으로 즉시 수동 1회 스캔 트리거."""
+    args = request.app["cli_args"]
+    asyncio.create_task(run_single_scan_bg(args))
+    return web.json_response({"message": "수동 스캔이 시작되었습니다. 1분 후 메인 화면(/) 또는 텔레그램을 확인하세요."})
+
+
+async def run_single_scan_bg(args):
+    async with aiohttp.ClientSession() as session:
+        await run_single_scan(session, args)
 
 
 async def handle_health(request):
     return web.Response(text="OK", status=200)
 
 
-def create_web_app():
+def create_web_app(args):
     app = web.Application()
+    app["cli_args"] = args
     app.router.add_get("/", handle_index)
+    app.router.add_get("/debug", handle_debug)
+    app.router.add_get("/scan", handle_manual_scan)
     app.router.add_get("/healthz", handle_health)
     return app
 
@@ -225,12 +309,12 @@ async def main():
     args = parser.parse_args()
 
     # 웹 서버 백그라운드 구동 (Render 포트 바인딩)
-    app = create_web_app()
+    app = create_web_app(args)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🚀 Render Healthcheck 웹서버 시작: port {PORT}")
+    log(f"🚀 Render Healthcheck 웹서버 시작: port {PORT}")
 
     # 스케줄러 실행
     await scheduler_loop(args)
@@ -240,4 +324,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("\n봇이 안전하게 종료되었습니다.")
+        log("봇이 안전하게 종료되었습니다.")
