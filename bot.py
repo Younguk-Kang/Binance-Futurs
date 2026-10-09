@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "15"))
 MIN_SCORE_NOTIFY = float(os.getenv("MIN_SCORE_NOTIFY", "3.0"))
-COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4.0"))
+COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "24.0"))
 PORT = int(os.getenv("PORT", "10000"))
 
 # 상태 관리 (중복 알림 방지용 캐시 및 실시간 상태)
@@ -86,7 +86,7 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
 
 
 def should_alert(item: dict) -> bool:
-    """중복 알림 방지(쿨다운) 및 급등 예외 검사 (캐시 변경 없음)."""
+    """중복 알림 방지(24시간 쿨다운). 한 번 포착된 종목은 24시간 거래량 초기화 후 다시 판단."""
     sym = item["symbol"]
     score = item["score"]
     now = time.time()
@@ -100,31 +100,20 @@ def should_alert(item: dict) -> bool:
     prev = alert_cache[sym]
     elapsed_hours = (now - prev["last_time"]) / 3600.0
 
-    # 1. 쿨다운 시간(기본 4시간) 경과 시 재알림 허용
+    # 포착 후 24시간이 경과해야만 다시 판단 (24h 롤링 거래량 초기화 대기)
     if elapsed_hours >= COOLDOWN_HOURS:
-        return True
-
-    # 2. 쿨다운 중이라도 점수가 35% 이상 급상승한 경우 예외 알림
-    if score >= prev["score"] * 1.35 and score >= 6.0:
-        return True
-
-    # 3. 펀딩비가 -1.5% 이하로 극단적 음수 폭락한 경우 예외 알림
-    fund = item.get("fund_now") or 0.0
-    if fund <= -0.015 and prev.get("fund_notified", 0) != fund:
         return True
 
     return False
 
 
 def record_alert_sent(item: dict):
-    """텔레그램 발송 성공 시에만 캐시 갱신."""
+    """텔레그램 발송 성공 시에만 캐시 갱신 (24시간 카운트다운 시작)."""
     sym = item["symbol"]
-    fund = item.get("fund_now") or 0.0
     alert_cache[sym] = {
         "last_time": time.time(),
         "score": item["score"],
         "price": item["price"],
-        "fund_notified": fund if fund <= -0.015 else 0.0,
     }
 
 
@@ -231,7 +220,7 @@ async def scheduler_loop(args):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• 스캔 주기 : {SCAN_INTERVAL_MIN}분\n"
             f"• 최소 점수 : {MIN_SCORE_NOTIFY}점\n"
-            f"• 알림 쿨다운 : {COOLDOWN_HOURS}시간\n"
+            f"• 알림 쿨다운 : {COOLDOWN_HOURS:.0f}시간 (거래량 초기화 대기)\n"
             f"• 감시 상태 : 정상 가동 중"
         )
         await send_telegram(session, startup_msg)
