@@ -19,6 +19,16 @@ from aiohttp import web
 
 from scanner import Client, CONCURRENCY, fmt_usd, fmt_pct, fmt_x, scan_live_candidates
 
+# .env 파일 자동 로드 (로컬 실행 편의용)
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
 # 환경변수 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -76,7 +86,7 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
 
 
 def should_alert(item: dict) -> bool:
-    """중복 알림 방지(쿨다운) 및 급등 예외 검사."""
+    """중복 알림 방지(쿨다운) 및 급등 예외 검사 (캐시 변경 없음)."""
     sym = item["symbol"]
     score = item["score"]
     now = time.time()
@@ -85,7 +95,6 @@ def should_alert(item: dict) -> bool:
         return False
 
     if sym not in alert_cache:
-        alert_cache[sym] = {"last_time": now, "score": score, "price": item["price"]}
         return True
 
     prev = alert_cache[sym]
@@ -93,26 +102,34 @@ def should_alert(item: dict) -> bool:
 
     # 1. 쿨다운 시간(기본 4시간) 경과 시 재알림 허용
     if elapsed_hours >= COOLDOWN_HOURS:
-        alert_cache[sym] = {"last_time": now, "score": score, "price": item["price"]}
         return True
 
     # 2. 쿨다운 중이라도 점수가 35% 이상 급상승한 경우 예외 알림
     if score >= prev["score"] * 1.35 and score >= 6.0:
-        alert_cache[sym] = {"last_time": now, "score": score, "price": item["price"]}
         return True
 
     # 3. 펀딩비가 -1.5% 이하로 극단적 음수 폭락한 경우 예외 알림
     fund = item.get("fund_now") or 0.0
     if fund <= -0.015 and prev.get("fund_notified", 0) != fund:
-        prev["fund_notified"] = fund
-        prev["last_time"] = now
         return True
 
     return False
 
 
+def record_alert_sent(item: dict):
+    """텔레그램 발송 성공 시에만 캐시 갱신."""
+    sym = item["symbol"]
+    fund = item.get("fund_now") or 0.0
+    alert_cache[sym] = {
+        "last_time": time.time(),
+        "score": item["score"],
+        "price": item["price"],
+        "fund_notified": fund if fund <= -0.015 else 0.0,
+    }
+
+
 def format_alert_message(d: dict, as_of_str: str) -> str:
-    """가독성 높은 텔레그램 HTML 카드 메시지 생성."""
+    """이모티콘 제거, 티커 최상단 강조, 상승률 표기 적용 메시지 생성."""
     sym = d["sym_display"]
     score = d["score"]
     vx = d["volx"] or 0.0
@@ -121,22 +138,31 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     prem = d.get("prem_now")
     fund = d.get("fund_now")
 
-    score_badge = "🔥 [초강력 펌핑 신호]" if score >= 10.0 else "⚡ [조기경보 감지]"
+    # "조기경보" 대체: 트레이딩 관점의 직관적인 수급/모멘텀 용어
+    badge = "[초강력 수급 폭증]" if score >= 10.0 else "[급등 시그널]"
 
     msg = (
-        f"🚨 <b>{score_badge}</b> <code>#{sym}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>종합 랭킹 점수:</b> <b>{score:.1f}점</b>\n"
-        f"💵 <b>현재 가격:</b> <code>${d['price']:.5g}</code>\n"
-        f"💰 <b>24h 거래대금:</b> {fmt_usd(d['vol24'])} (평소의 <b>{vx:.1f}배</b>)\n"
-        f"⚡ <b>6h 가속도:</b> {v6x:.1f}x\n"
-        f"🚀 <b>수익률:</b> 24h <b>{fmt_pct(d['ret24'])}</b> | 72h {fmt_pct(d['ret72'])}\n"
-        f"🔻 <b>72h 고점대비:</b> {fmt_pct(d['from_high'])}\n"
-        f"📈 <b>24h OI 변화율:</b> <b>{fmt_pct(oi_chg, 1)}</b>\n"
-        f"📉 <b>최신 펀딩비:</b> <code>{fmt_pct(fund, 3)}</code>\n"
-        f"⚖️ <b>선물 괴리율(Prem):</b> {fmt_pct(prem, 2)}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ <i>{as_of_str} UTC 봉 마감 기준</i>"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{badge} {sym}USDT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"종합 점수 : <b>{score:.1f}점</b>\n"
+        f"현재 가격 : <code>${d['price']:.5g}</code>\n"
+        f"\n"
+        f"[가격 및 상승률]\n"
+        f"• 24h 상승률 : <b>{fmt_pct(d['ret24'])}</b>\n"
+        f"• 72h 상승률 : {fmt_pct(d['ret72'])}\n"
+        f"• 72h 고점 대비 : {fmt_pct(d['from_high'])}\n"
+        f"\n"
+        f"[거래대금 및 수급]\n"
+        f"• 24h 거래대금 : {fmt_usd(d['vol24'])} (평균 대비 <b>{vx:.1f}배</b>)\n"
+        f"• 6h 거래 가속도 : {v6x:.1f}배\n"
+        f"• 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
+        f"\n"
+        f"[선물 파생 지표]\n"
+        f"• 최신 펀딩비 : <code>{fmt_pct(fund, 3)}</code>\n"
+        f"• 선물 괴리율 : {fmt_pct(prem, 2)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{as_of_str} UTC 봉 마감 기준"
     )
     return msg
 
@@ -175,6 +201,7 @@ async def run_single_scan(session: aiohttp.ClientSession, args):
                 text = format_alert_message(item, as_of_str)
                 success = await send_telegram(session, text)
                 if success:
+                    record_alert_sent(item)
                     bot_state["total_alerts_sent"] += 1
                 await asyncio.sleep(0.5)  # 텔레그램 초당 발송 제한 방지
         else:
@@ -199,12 +226,13 @@ async def scheduler_loop(args):
     async with aiohttp.ClientSession() as session:
         # 기동 안내 메시지 (토큰 등록 시 1회 발송)
         startup_msg = (
-            f"🤖 <b>[Binance Alert Bot 가동]</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"• 스캔 주기: <b>{SCAN_INTERVAL_MIN}분</b>\n"
-            f"• 최소 알림 점수: <b>{MIN_SCORE_NOTIFY}점</b>\n"
-            f"• 쿨다운 시간: <b>{COOLDOWN_HOURS}시간</b>\n"
-            f"• 상태: <b>정상 감시 중 🟢</b>"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>[시스템 가동] 바이낸스 선물 급등 스캐너</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• 스캔 주기 : {SCAN_INTERVAL_MIN}분\n"
+            f"• 최소 점수 : {MIN_SCORE_NOTIFY}점\n"
+            f"• 알림 쿨다운 : {COOLDOWN_HOURS}시간\n"
+            f"• 감시 상태 : 정상 가동 중"
         )
         await send_telegram(session, startup_msg)
 
