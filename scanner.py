@@ -351,14 +351,61 @@ async def fetch_oi_change(c: Client, symbol: str):
         return None
 
 
+_MCAP_CACHE = {"data": {}, "last_update": 0}
+
+
+async def get_market_caps(session: aiohttp.ClientSession) -> dict:
+    """바이낸스 공식 마케팅 API에서 전체 심볼의 시가총액(Market Cap) 조회 (1시간 캐싱)."""
+    now = time.time()
+    if _MCAP_CACHE["data"] and (now - _MCAP_CACHE["last_update"]) < 3600:
+        return _MCAP_CACHE["data"]
+    try:
+        url = "https://www.binance.com/bapi/composite/v1/public/marketing/symbol/list"
+        async with session.get(url, headers=DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                res = await r.json()
+                items = res.get("data", [])
+                m_map = {}
+                for it in items:
+                    sym = it.get("symbol")
+                    mcap = float(it.get("marketCap") or 0)
+                    if sym and mcap > 0:
+                        m_map[sym] = mcap
+                if m_map:
+                    _MCAP_CACHE["data"] = m_map
+                    _MCAP_CACHE["last_update"] = now
+                    return m_map
+    except Exception as ex:
+        print(f"[warn] fetch market cap failed: {ex}")
+    return _MCAP_CACHE["data"]
+
+
+async def fetch_recent_volume(c: Client, symbol: str):
+    """최근 15분 및 1시간 실시간 선물 거래대금 조회."""
+    try:
+        kl = await c.get("/fapi/v1/klines", {
+            "symbol": symbol, "interval": "15m", "limit": 5
+        })
+        if not kl or len(kl) < 2:
+            return 0.0, 0.0
+        v15_closed = float(kl[-2][7])
+        v15_cur = float(kl[-1][7])
+        v15 = max(v15_closed, v15_cur)
+        v1h = sum(float(k[7]) for k in kl[-5:-1])
+        return v15, v1h
+    except Exception:
+        return 0.0, 0.0
+
+
 async def scan_live_candidates(c: Client, args):
     now_ms = int(time.time() * 1000)
     end_ms = now_ms // HOUR_MS * HOUR_MS
 
-    # 1. 24hr 티커 및 프리미엄 인덱스 1회 일괄 조회 (525개 klines 호출로 인한 418 IP 차단 원천 방지)
+    # 1. 24hr 티커, 프리미엄 인덱스, 시가총액 일괄 조회 (525개 klines 호출로 인한 418 IP 차단 원천 방지)
     tickers_task = c.get("/fapi/v1/ticker/24hr")
     prem_task = c.get("/fapi/v1/premiumIndex")
-    ticker_list, prem_list = await asyncio.gather(tickers_task, prem_task)
+    mcap_task = get_market_caps(c.s)
+    ticker_list, prem_list, mcap_map = await asyncio.gather(tickers_task, prem_task, mcap_task)
 
     # 24h 거래대금 하한 기준(args.live_min_vol)으로 대상 심볼 사전 필터링 (약 30~40개로 압축)
     vol_cutoff = args.live_min_vol * 0.90
@@ -396,19 +443,36 @@ async def scan_live_candidates(c: Client, args):
         live_symbol(c, s, end_ms, now_ms, prem_map, args) for s in target_symbols))
     candidates = [cand for cand in candidates if cand is not None]
 
-    # 1차 통과 종목 대상 OI 변화율 조회
+    # 1차 통과 종목 대상 OI 변화율 및 최근 15분/1시간 거래량 조회
     if candidates:
-        oi_results = await asyncio.gather(*(
-            fetch_oi_change(c, cand["symbol"]) for cand in candidates))
-        for cand, oi_chg in zip(candidates, oi_results):
+        oi_tasks = [fetch_oi_change(c, cand["symbol"]) for cand in candidates]
+        vol_tasks = [fetch_recent_volume(c, cand["symbol"]) for cand in candidates]
+        oi_results, vol_results = await asyncio.gather(
+            asyncio.gather(*oi_tasks),
+            asyncio.gather(*vol_tasks)
+        )
+        for cand, oi_chg, (v15, v1h) in zip(candidates, oi_results, vol_results):
             cand["oi_chg24"] = oi_chg
+            cand["vol_15m"] = v15
+            cand["vol_1h"] = v1h
 
-            # 지시서 가중합 점수식
+            sym = cand["symbol"]
+            mcap = mcap_map.get(sym, 0.0)
+            cand["mcap"] = mcap
+            cand["vol_15m_mcap_pct"] = (v15 / mcap * 100.0) if mcap > 0 else 0.0
+            cand["vol_1h_mcap_pct"] = (v1h / mcap * 100.0) if mcap > 0 else 0.0
+            cand["vol24_mcap_pct"] = (cand["vol24"] / mcap * 100.0) if mcap > 0 else 0.0
+
+            # 지시서 가중합 점수식 + 시총 대비 수급 보너스
             vx = cand["volx"] or 0.0
             r72 = cand["ret72"]
             v6x = cand["vol_6h_x"] or 0.0
             p_now = cand["prem_now"] or 0.0
             oi_val = cand["oi_chg24"] or 0.0
+            v15_pct = cand["vol_15m_mcap_pct"]
+
+            # 15분 거래량이 시총의 5% 이상일 때 수급 보너스 가산 (5%면 +1점, 10%면 +2점, 20%면 +4점, 최대 6점)
+            mcap_bonus = min(v15_pct / 5.0, 6.0) if v15_pct >= 3.0 else 0.0
 
             cand["score"] = (
                 min(vx, 50.0) / 10.0
@@ -416,6 +480,7 @@ async def scan_live_candidates(c: Client, args):
                 + min(v6x, 10.0) / 2.0
                 + max(-p_now, 0.0) * 20.0
                 + max(oi_val, 0.0) * 2.0
+                + mcap_bonus
             )
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
