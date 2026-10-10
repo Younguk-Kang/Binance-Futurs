@@ -664,12 +664,12 @@ async def main():
                     help="최저 펀딩비 상한 (예: -0.005 = -0.5%%)")
     ap.add_argument("--live", action="store_true",
                     help="조기경보 라이브 모드 실행")
-    ap.add_argument("--live-min-vol", type=float, default=2e8,
-                    help="라이브: 24h 거래대금 하한 (기본 2억달러)")
-    ap.add_argument("--live-min-volx", type=float, default=3.0,
-                    help="라이브: VolX 하한 (기본 3.0x)")
-    ap.add_argument("--live-min-ret72", type=float, default=0.20,
-                    help="라이브: 최근 72h 수익률 하한 (기본 +20%%)")
+    ap.add_argument("--live-min-vol", type=float, default=3e7,
+                    help="라이브: 24h 거래대금 하한 (기본 3천만달러)")
+    ap.add_argument("--live-min-volx", type=float, default=2.0,
+                    help="라이브: VolX 하한 (기본 2.0x)")
+    ap.add_argument("--live-min-ret72", type=float, default=0.10,
+                    help="라이브: 최근 72h 수익률 하한 (기본 +10%%)")
     ap.add_argument("--top", type=int, default=30,
                     help="라이브: 출력 최대 행 수 (기본 30)")
     ap.add_argument("--concurrency", type=int, default=CONCURRENCY)
