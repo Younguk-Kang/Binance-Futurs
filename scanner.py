@@ -380,21 +380,73 @@ async def get_market_caps(session: aiohttp.ClientSession) -> dict:
     return _MCAP_CACHE["data"]
 
 
-async def fetch_recent_volume(c: Client, symbol: str):
-    """최근 15분 및 1시간 실시간 선물 거래대금 조회."""
+async def fetch_recent_metrics(c: Client, symbol: str):
+    """최근 15분 및 1시간 실시간 선물 거래대금, Taker 매수 비중(TIB), 롱숏 계정/포지션 비율 조회."""
     try:
-        kl = await c.get("/fapi/v1/klines", {
+        kl_task = c.get("/fapi/v1/klines", {
             "symbol": symbol, "interval": "15m", "limit": 5
         })
-        if not kl or len(kl) < 2:
-            return 0.0, 0.0
-        v15_closed = float(kl[-2][7])
-        v15_cur = float(kl[-1][7])
-        v15 = max(v15_closed, v15_cur)
-        v1h = sum(float(k[7]) for k in kl[-5:-1])
-        return v15, v1h
+        pos_task = c.get("/futures/data/topLongShortPositionRatio", {
+            "symbol": symbol, "period": "15m", "limit": 1
+        })
+        acc_task = c.get("/futures/data/globalLongShortAccountRatio", {
+            "symbol": symbol, "period": "15m", "limit": 1
+        })
+        kl, pos, acc = await asyncio.gather(kl_task, pos_task, acc_task, return_exceptions=True)
+
+        v15, v1h, taker_buy_pct, tib = 0.0, 0.0, 50.0, 0.0
+        if isinstance(kl, list) and len(kl) >= 2:
+            v15_closed = float(kl[-2][7])
+            v15_cur = float(kl[-1][7])
+            v15 = max(v15_closed, v15_cur)
+            v1h = sum(float(k[7]) for k in kl[-5:-1])
+
+            # 더 큰 거래량이 실린 15분 봉의 Taker 시장가 매수 비중 산출 (인덱스 10: Taker Buy Quote Vol)
+            target_k = kl[-2] if v15 == v15_closed else kl[-1]
+            tot_q = float(target_k[7])
+            tk_buy_q = float(target_k[10])
+            if tot_q > 0:
+                ratio = min(max(tk_buy_q / tot_q, 0.0), 1.0)
+                taker_buy_pct = ratio * 100.0
+                tib = 2.0 * ratio - 1.0
+
+        lsr_whale = None
+        if isinstance(pos, list) and len(pos) > 0 and isinstance(pos[-1], dict) and "longShortRatio" in pos[-1]:
+            try:
+                lsr_whale = float(pos[-1]["longShortRatio"])
+            except (ValueError, TypeError):
+                pass
+
+        lsr_retail = None
+        if isinstance(acc, list) and len(acc) > 0 and isinstance(acc[-1], dict) and "longShortRatio" in acc[-1]:
+            try:
+                lsr_retail = float(acc[-1]["longShortRatio"])
+            except (ValueError, TypeError):
+                pass
+
+        squeeze_div = None
+        if lsr_whale is not None and lsr_retail is not None and lsr_retail > 0:
+            squeeze_div = lsr_whale / max(lsr_retail, 0.05)
+
+        return {
+            "vol_15m": v15,
+            "vol_1h": v1h,
+            "taker_buy_pct": taker_buy_pct,
+            "tib": tib,
+            "lsr_whale": lsr_whale,
+            "lsr_retail": lsr_retail,
+            "squeeze_div": squeeze_div,
+        }
     except Exception:
-        return 0.0, 0.0
+        return {
+            "vol_15m": 0.0,
+            "vol_1h": 0.0,
+            "taker_buy_pct": 50.0,
+            "tib": 0.0,
+            "lsr_whale": None,
+            "lsr_retail": None,
+            "squeeze_div": None,
+        }
 
 
 async def scan_live_candidates(c: Client, args):
@@ -443,45 +495,62 @@ async def scan_live_candidates(c: Client, args):
         live_symbol(c, s, end_ms, now_ms, prem_map, args) for s in target_symbols))
     candidates = [cand for cand in candidates if cand is not None]
 
-    # 1차 통과 종목 대상 OI 변화율 및 최근 15분/1시간 거래량 조회
+    # 1차 통과 종목 대상 OI 변화율 및 실시간 미시구조 지표(TIB, 롱숏비율) 조회
     if candidates:
         oi_tasks = [fetch_oi_change(c, cand["symbol"]) for cand in candidates]
-        vol_tasks = [fetch_recent_volume(c, cand["symbol"]) for cand in candidates]
-        oi_results, vol_results = await asyncio.gather(
+        metrics_tasks = [fetch_recent_metrics(c, cand["symbol"]) for cand in candidates]
+        oi_results, metrics_results = await asyncio.gather(
             asyncio.gather(*oi_tasks),
-            asyncio.gather(*vol_tasks)
+            asyncio.gather(*metrics_tasks)
         )
-        for cand, oi_chg, (v15, v1h) in zip(candidates, oi_results, vol_results):
+        for cand, oi_chg, metrics in zip(candidates, oi_results, metrics_results):
             cand["oi_chg24"] = oi_chg
-            cand["vol_15m"] = v15
-            cand["vol_1h"] = v1h
+            cand["vol_15m"] = metrics["vol_15m"]
+            cand["vol_1h"] = metrics["vol_1h"]
+            cand["taker_buy_pct"] = metrics["taker_buy_pct"]
+            cand["tib"] = metrics["tib"]
+            cand["lsr_whale"] = metrics["lsr_whale"]
+            cand["lsr_retail"] = metrics["lsr_retail"]
+            cand["squeeze_div"] = metrics["squeeze_div"]
 
             sym = cand["symbol"]
             mcap = mcap_map.get(sym, 0.0)
             cand["mcap"] = mcap
-            cand["vol_15m_mcap_pct"] = (v15 / mcap * 100.0) if mcap > 0 else 0.0
-            cand["vol_1h_mcap_pct"] = (v1h / mcap * 100.0) if mcap > 0 else 0.0
+            cand["vol_15m_mcap_pct"] = (metrics["vol_15m"] / mcap * 100.0) if mcap > 0 else 0.0
+            cand["vol_1h_mcap_pct"] = (metrics["vol_1h"] / mcap * 100.0) if mcap > 0 else 0.0
             cand["vol24_mcap_pct"] = (cand["vol24"] / mcap * 100.0) if mcap > 0 else 0.0
 
-            # 지시서 가중합 점수식 + 시총 대비 수급 보너스
+            # 4대 팩터 통합 종합 점수식 (v4)
             vx = cand["volx"] or 0.0
-            r72 = cand["ret72"]
             v6x = cand["vol_6h_x"] or 0.0
-            p_now = cand["prem_now"] or 0.0
-            oi_val = cand["oi_chg24"] or 0.0
             v15_pct = cand["vol_15m_mcap_pct"]
+            tib = cand["tib"]
+            sq_div = cand["squeeze_div"]
+            fund_now = cand["fund_now"] or 0.0
+            prem_now = cand["prem_now"] or 0.0
+            oi_val = cand["oi_chg24"] or 0.0
+            ret24 = cand["ret24"] or 0.0
 
-            # 15분 거래량이 시총의 5% 이상일 때 수급 보너스 가산 (5%면 +1점, 10%면 +2점, 20%면 +4점, 최대 6점)
-            mcap_bonus = min(v15_pct / 5.0, 6.0) if v15_pct >= 3.0 else 0.0
+            # 1. 거래량 배수 (최대 8.0점)
+            s_vol = min(vx, 30.0) / 10.0 + min(v6x, 10.0) / 2.0
 
-            cand["score"] = (
-                min(vx, 50.0) / 10.0
-                + max(r72, 0.0) * 5.0
-                + min(v6x, 10.0) / 2.0
-                + max(-p_now, 0.0) * 20.0
-                + max(oi_val, 0.0) * 2.0
-                + mcap_bonus
-            )
+            # 2. 시총 회전율 (최대 6.0점)
+            s_mcap = min(v15_pct / 5.0, 6.0) if v15_pct >= 3.0 else 0.0
+
+            # 3. 체결 공격성 TIB (최대 5.0점: 시장가 매수 75%면 +2.5점, 85%면 +3.5점)
+            s_tib = max(0.0, tib) * 5.0
+
+            # 4. 숏스퀴즈 다이버전스 & 음펀비/괴리 (최대 8.0점)
+            s_div = max(0.0, sq_div - 1.0) * 3.0 if sq_div else 0.0
+            s_fund = max(0.0, -fund_now) * 100.0
+            s_prem = max(0.0, -prem_now) * 20.0
+            s_squeeze = min(s_div + s_fund + s_prem, 8.0)
+
+            # 5. 미결제약정 & 단기 모멘텀 (최대 4.0점)
+            s_oi = max(0.0, oi_val) * 2.0
+            s_ret = max(0.0, min(ret24, 0.50)) * 4.0
+
+            cand["score"] = s_vol + s_mcap + s_tib + s_squeeze + s_oi + s_ret
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top_candidates = candidates[:args.top]

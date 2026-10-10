@@ -120,7 +120,7 @@ def record_alert_sent(item: dict):
 
 
 def format_alert_message(d: dict, as_of_str: str) -> str:
-    """이모티콘 제거, 티커 최상단 강조, 시총 대비 거래량 지표 적용 메시지 생성."""
+    """금융 터미널 스타일 가시성 극대화 알림 메시지 생성."""
     sym = d["sym_display"]
     score = d["score"]
     vx = d["volx"] or 0.0
@@ -136,19 +136,32 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     v1h_pct = d.get("vol_1h_mcap_pct", 0.0)
     v24_pct = d.get("vol24_mcap_pct", 0.0)
 
-    # "조기경보" 대체: 트레이딩 관점의 직관적인 수급/모멘텀 용어
-    if v15_pct >= 15.0 or score >= 10.0:
-        badge = "[초강력 수급 폭증]"
-    elif v15_pct >= 5.0 or score >= 3.0:
-        badge = "[급등 시그널]"
-    else:
-        badge = "[수급 유입 감지]"
+    taker_buy_pct = d.get("taker_buy_pct", 50.0)
+    tib = d.get("tib", 0.0)
+    lsr_whale = d.get("lsr_whale")
+    lsr_retail = d.get("lsr_retail")
+    squeeze_div = d.get("squeeze_div")
 
-    # 시총 대비 수치 서식화
+    # 신호 배지 정밀 분류 (상호 배타적 우선순위)
+    if squeeze_div and squeeze_div >= 1.4 and taker_buy_pct >= 65.0 and ((fund and fund <= 0.0) or (prem and prem < 0.0)):
+        badge = "[약탈적 숏스퀴즈]"
+    elif v15_pct >= 8.0 and taker_buy_pct >= 65.0 and (d.get("from_high", 0.0) >= -0.15):
+        badge = "[초동 수급 이상방량]"
+    elif score >= 10.0 or v15_pct >= 15.0 or vx >= 15.0:
+        badge = "[초강력 수급 폭증]"
+    else:
+        badge = "[급등 시그널]"
+
+    # 시총 관련 텍스트
     mcap_str = fmt_usd(mcap) if mcap > 0 else "미확인"
     v15_pct_str = f"시총의 <b>{v15_pct:.1f}%</b>" if mcap > 0 else "-"
     v1h_pct_str = f"시총의 {v1h_pct:.1f}%" if mcap > 0 else "-"
-    v24_pct_str = f"시총의 {v24_pct:.1f}% 회전" if mcap > 0 else "-"
+    v24_pct_str = f"시총의 {v24_pct:.0f}% 회전" if mcap > 0 else "-"
+
+    # 포지션 관련 텍스트
+    retail_str = f"<b>{lsr_retail:.2f}</b> (숏 과밀)" if (lsr_retail and lsr_retail < 0.8) else (f"{lsr_retail:.2f}" if lsr_retail else "-")
+    whale_str = f"<b>{lsr_whale:.2f}</b> (롱 집중)" if (lsr_whale and lsr_whale > 1.2) else (f"{lsr_whale:.2f}" if lsr_whale else "-")
+    div_str = f"<b>{squeeze_div:.2f}배</b>" if squeeze_div else "-"
 
     msg = (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -157,22 +170,25 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         f"종합 점수 : <b>{score:.1f}점</b>\n"
         f"현재 가격 : <b>${d['price']:.5g}</b>\n"
         f"\n"
-        f"[가격 및 상승률]\n"
-        f"• 24h 상승률 : <b>{fmt_pct(d['ret24'])}</b>\n"
-        f"• 72h 상승률 : {fmt_pct(d['ret72'])}\n"
+        f"[가격 및 변동]\n"
+        f"• 24h 변동률 : <b>{fmt_pct(d['ret24'])}</b>\n"
+        f"• 72h 변동률 : {fmt_pct(d['ret72'])}\n"
         f"• 72h 고점 대비 : {fmt_pct(d['from_high'])}\n"
         f"\n"
-        f"[거래대금 및 수급 (시총 대비)]\n"
-        f"• 갑작스런 거래량 발생 : <b>{fmt_usd(v15)}</b> (15분, {v15_pct_str})\n"
-        f"• 1h 누적 거래량 : {fmt_usd(v1h)} ({v1h_pct_str})\n"
-        f"• 24h 총 거래대금 : {fmt_usd(d['vol24'])} ({v24_pct_str})\n"
+        f"[수급 및 체결 공격성]\n"
+        f"• 15m 이상거래 : <b>{fmt_usd(v15)}</b> ({v15_pct_str})\n"
+        f"• 1h 누적 거래 : {fmt_usd(v1h)} ({v1h_pct_str})\n"
+        f"• 24h 총 거래 : {fmt_usd(d['vol24'])} ({v24_pct_str})\n"
         f"• 유통 시가총액 : <b>{mcap_str}</b>\n"
-        f"• 평균 대비 거래량 : <b>{vx:.1f}배</b> (6h 가속도 {v6x:.1f}배)\n"
-        f"• 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
+        f"• 시장가 매수 비중 : <b>{taker_buy_pct:.1f}%</b> (TIB {tib:+.2f})\n"
+        f"• 평균 대비 거래량 : <b>{vx:.1f}배</b> (6h 가속 {v6x:.1f}배)\n"
         f"\n"
-        f"[선물 파생 지표]\n"
-        f"• 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b>\n"
-        f"• 선물 괴리율 : {fmt_pct(prem, 2)}\n"
+        f"[포지션 및 숏스퀴즈 지표]\n"
+        f"• 개미 롱숏(계정) : {retail_str}\n"
+        f"• 고래 롱숏(포지션) : {whale_str}\n"
+        f"• 스퀴즈 괴리도 : {div_str}\n"
+        f"• 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
+        f"• 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{as_of_str} UTC 봉 마감 기준"
     )
