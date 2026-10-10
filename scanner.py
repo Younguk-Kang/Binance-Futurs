@@ -40,7 +40,7 @@ LOOKBACK = BASELINE + PRE   # 스캔 시작 전 추가로 받아올 봉 수
 LOOKBACK_LIVE = BASELINE + PRE + WINDOW  # 라이브 모드 필요 봉 수 (264h)
 MERGE_GAP_MS = 48 * HOUR_MS
 OI_LIMIT_MS = 30 * 24 * HOUR_MS
-CONCURRENCY = 10            # 안전한 동시 요청 수
+CONCURRENCY = 15            # 안전한 동시 요청 수 (113개 종목 고속 스캔)
 
 
 DEFAULT_HEADERS = {
@@ -306,7 +306,7 @@ async def live_symbol(c: Client, symbol: str, end_ms: int, now_ms: int,
         # 1차 필터
         if vol24 < args.live_min_vol:
             return None
-        if not ((volx is not None and volx >= args.live_min_volx) or ret72 >= args.live_min_ret72):
+        if not ((volx is not None and volx >= args.live_min_volx) or ret72 >= args.live_min_ret72 or (vol_6h_x is not None and vol_6h_x >= 2.0)):
             return None
 
         # 이미 끝난 펌핑 제외 (덤프 진행 중)

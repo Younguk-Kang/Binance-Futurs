@@ -35,6 +35,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "15"))
 MIN_SCORE_NOTIFY = float(os.getenv("MIN_SCORE_NOTIFY", "3.0"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "24.0"))
+LIVE_MIN_VOL_MILLION = float(os.getenv("LIVE_MIN_VOL_MILLION", "30.0"))
+LIVE_MIN_VOLX = float(os.getenv("LIVE_MIN_VOLX", "2.0"))
+LIVE_MIN_RET72 = float(os.getenv("LIVE_MIN_RET72", "0.10"))
 PORT = int(os.getenv("PORT", "10000"))
 
 # 상태 관리 (중복 알림 방지용 캐시 및 실시간 상태)
@@ -290,6 +293,7 @@ async def scheduler_loop(args):
             f"<b>[시스템 가동] 바이낸스 선물 급등 스캐너</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• 스캔 주기 : {SCAN_INTERVAL_MIN}분\n"
+            f"• 24h 최소 거래량 : ${LIVE_MIN_VOL_MILLION:.0f}M (초동 알트코인 포착)\n"
             f"• 최소 점수 : {MIN_SCORE_NOTIFY}점\n"
             f"• 알림 쿨다운 : {COOLDOWN_HOURS:.0f}시간 (거래량 초기화 대기)\n"
             f"• 감시 상태 : 정상 가동 중"
@@ -389,9 +393,9 @@ def create_web_app(args):
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--live-min-vol", type=float, default=2e8)
-    parser.add_argument("--live-min-volx", type=float, default=3.0)
-    parser.add_argument("--live-min-ret72", type=float, default=0.20)
+    parser.add_argument("--live-min-vol", type=float, default=LIVE_MIN_VOL_MILLION * 1e6)
+    parser.add_argument("--live-min-volx", type=float, default=LIVE_MIN_VOLX)
+    parser.add_argument("--live-min-ret72", type=float, default=LIVE_MIN_RET72)
     parser.add_argument("--top", type=int, default=30)
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     args = parser.parse_args()
