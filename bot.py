@@ -120,9 +120,14 @@ def record_alert_sent(item: dict):
 
 
 def format_alert_message(d: dict, as_of_str: str) -> str:
-    """금융 터미널 스타일 가시성 극대화 알림 메시지 생성."""
+    """금융 터미널 스타일 가시성 극대화 및 특이사항 색상 강조 알림 메시지 생성."""
     sym = d["sym_display"]
     score = d["score"]
+    price = d["price"]
+    ret24 = d["ret24"]
+    ret72 = d["ret72"]
+    from_high = d["from_high"]
+    vol24 = d["vol24"]
     vx = d["volx"] or 0.0
     v6x = d["vol_6h_x"] or 0.0
     oi_chg = d.get("oi_chg24")
@@ -144,13 +149,39 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
 
     # 신호 배지 정밀 분류 (상호 배타적 우선순위)
     if squeeze_div and squeeze_div >= 1.4 and taker_buy_pct >= 65.0 and ((fund and fund <= 0.0) or (prem and prem < 0.0)):
-        badge = "[약탈적 숏스퀴즈]"
-    elif v15_pct >= 8.0 and taker_buy_pct >= 65.0 and (d.get("from_high", 0.0) >= -0.15):
-        badge = "[초동 수급 이상방량]"
+        badge = "🔴 [약탈적 숏스퀴즈]"
+    elif v15_pct >= 8.0 and taker_buy_pct >= 65.0 and from_high >= -0.15:
+        badge = "🟢 [초동 수급 이상방량]"
     elif score >= 10.0 or v15_pct >= 15.0 or vx >= 15.0:
-        badge = "[초강력 수급 폭증]"
+        badge = "🟡 [초강력 수급 폭증]"
     else:
-        badge = "[급등 시그널]"
+        badge = "⚪ [급등 시그널]"
+
+    # 특이사항 탐지 및 색상 불릿 요약 블록 생성
+    anomalies = []
+    if squeeze_div and squeeze_div >= 1.4:
+        anomalies.append(f"🔴 <b>스퀴즈 괴리 {squeeze_div:.2f}배</b> (고래 롱 vs 개미 숏 대립)")
+    if v15_pct and v15_pct >= 5.0:
+        anomalies.append(f"🟢 <b>15분 거래량 시총 {v15_pct:.1f}%</b> ({fmt_usd(v15)} 대량 집중)")
+    if taker_buy_pct and taker_buy_pct >= 65.0:
+        anomalies.append(f"🔵 <b>시장가 매수 {taker_buy_pct:.1f}%</b> (TIB {tib:+.2f} 공격적 체결)")
+    if oi_chg and oi_chg >= 0.30:
+        anomalies.append(f"🟣 <b>24h 미결제약정 {fmt_pct(oi_chg, 1)}</b> (포지션 급증)")
+    if (fund and fund <= -0.005) or (prem and prem <= -0.005):
+        anomalies.append(f"🟠 <b>음수 펀딩비 {fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})")
+    elif vx and vx >= 10.0 and len(anomalies) < 4:
+        anomalies.append(f"🟡 <b>평균 대비 거래량 {vx:.1f}배</b> (7일 기준선 대비)")
+
+    anomaly_block = ""
+    if anomalies:
+        anomaly_block = "[핵심 특이사항]\n" + "\n".join(anomalies) + "\n\n"
+
+    # 세부 항목 불릿 색상 매핑
+    b_v15 = "🟢" if (v15_pct and v15_pct >= 5.0) else "•"
+    b_tib = "🔵" if (taker_buy_pct and taker_buy_pct >= 65.0) else "•"
+    b_div = "🔴" if (squeeze_div and squeeze_div >= 1.4) else "•"
+    b_oi = "🟣" if (oi_chg and oi_chg >= 0.30) else "•"
+    b_fund = "🟠" if ((fund and fund <= -0.005) or (prem and prem <= -0.005)) else "•"
 
     # 시총 관련 텍스트
     mcap_str = fmt_usd(mcap) if mcap > 0 else "미확인"
@@ -168,27 +199,28 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         f"<b>{badge} {sym}USDT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"종합 점수 : <b>{score:.1f}점</b>\n"
-        f"현재 가격 : <b>${d['price']:.5g}</b>\n"
+        f"현재 가격 : <b>${price:.5g}</b>\n"
         f"\n"
+        f"{anomaly_block}"
         f"[가격 및 변동]\n"
-        f"• 24h 변동률 : <b>{fmt_pct(d['ret24'])}</b>\n"
-        f"• 72h 변동률 : {fmt_pct(d['ret72'])}\n"
-        f"• 72h 고점 대비 : {fmt_pct(d['from_high'])}\n"
+        f"• 24h 변동률 : <b>{fmt_pct(ret24)}</b>\n"
+        f"• 72h 변동률 : {fmt_pct(ret72)}\n"
+        f"• 72h 고점 대비 : {fmt_pct(from_high)}\n"
         f"\n"
         f"[수급 및 체결 공격성]\n"
-        f"• 15m 이상거래 : <b>{fmt_usd(v15)}</b> ({v15_pct_str})\n"
+        f"{b_v15} 15m 이상거래 : <b>{fmt_usd(v15)}</b> ({v15_pct_str})\n"
         f"• 1h 누적 거래 : {fmt_usd(v1h)} ({v1h_pct_str})\n"
-        f"• 24h 총 거래 : {fmt_usd(d['vol24'])} ({v24_pct_str})\n"
+        f"• 24h 총 거래 : {fmt_usd(vol24)} ({v24_pct_str})\n"
         f"• 유통 시가총액 : <b>{mcap_str}</b>\n"
-        f"• 시장가 매수 비중 : <b>{taker_buy_pct:.1f}%</b> (TIB {tib:+.2f})\n"
+        f"{b_tib} 시장가 매수 비중 : <b>{taker_buy_pct:.1f}%</b> (TIB {tib:+.2f})\n"
         f"• 평균 대비 거래량 : <b>{vx:.1f}배</b> (6h 가속 {v6x:.1f}배)\n"
         f"\n"
         f"[포지션 및 숏스퀴즈 지표]\n"
         f"• 개미 롱숏(계정) : {retail_str}\n"
         f"• 고래 롱숏(포지션) : {whale_str}\n"
-        f"• 스퀴즈 괴리도 : {div_str}\n"
-        f"• 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
-        f"• 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n"
+        f"{b_div} 스퀴즈 괴리도 : {div_str}\n"
+        f"{b_oi} 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
+        f"{b_fund} 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{as_of_str} UTC 봉 마감 기준"
     )
