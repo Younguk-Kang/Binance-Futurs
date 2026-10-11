@@ -89,7 +89,9 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
 
 
 def should_alert(item: dict) -> bool:
-    """중복 알림 방지(24시간 쿨다운). 한 번 포착된 종목은 24시간 거래량 초기화 후 다시 판단."""
+    """중복 알림 방지(24시간 쿨다운). 한 번 포착된 종목은 24시간 거래량 초기화 후 다시 판단.
+    단, 24시간 이내라도 특별한 중대 변화(2차 대폭등, 숏스퀴즈 가속, 수급 2차 폭발, OI 대량 순증) 발생 시 재알림.
+    """
     sym = item["symbol"]
     score = item["score"]
     v15_pct = item.get("vol_15m_mcap_pct") or 0.0
@@ -109,16 +111,55 @@ def should_alert(item: dict) -> bool:
     if elapsed_hours >= COOLDOWN_HOURS:
         return True
 
+    # --- 24시간 쿨다운 중 특별한 변화(예외 재알림) 검사 ---
+    # 단기 도배 방지를 위해 최소 45분(0.75시간)은 경과해야 재알림 허용
+    if elapsed_hours < 0.75:
+        return False
+
+    price = item.get("price", 0.0)
+    prev_price = prev.get("price", 0.0)
+    squeeze_div = item.get("squeeze_div", 0.0) or 0.0
+    fund = item.get("fund_now", 0.0) or 0.0
+    v15 = item.get("vol_15m", 0.0) or 0.0
+    oi_total = item.get("oi_total", 0.0) or 0.0
+
+    # 1. 가격 추가 대폭등 (+25% 이상 추가 상승)
+    if prev_price > 0 and price >= prev_price * 1.25:
+        item["re_alert_reason"] = f"가격 +{((price / prev_price - 1) * 100):.1f}% 추가 급등"
+        return True
+
+    # 2. 숏스퀴즈 가속 (괴리도 1.8배 이상 & 음수 펀딩비 & 이전 괴리도 대비 20% 이상 확대)
+    prev_div = prev.get("squeeze_div", 1.0) or 1.0
+    if squeeze_div >= 1.8 and fund <= -0.0003 and squeeze_div >= prev_div * 1.2:
+        item["re_alert_reason"] = f"숏스퀴즈 가속 (괴리율 {squeeze_div:.2f}배 확대)"
+        return True
+
+    # 3. 단기 15분 수급 2차 폭발 (시총 대비 15% 이상 & 이전 15분 거래대금 대비 1.5배 이상)
+    prev_v15 = prev.get("vol_15m", 0.0) or 0.0
+    if v15_pct >= 15.0 and v15 >= prev_v15 * 1.5:
+        item["re_alert_reason"] = f"15분 수급 2차 폭발 (시총 {v15_pct:.1f}% 집중)"
+        return True
+
+    # 4. 미결제약정 대량 순증 (총액 $10M 이상 & 이전 대비 30% 이상 순증)
+    prev_oi = prev.get("oi_total", 0.0) or 0.0
+    if oi_total >= 10_000_000 and prev_oi > 0 and oi_total >= prev_oi * 1.30:
+        item["re_alert_reason"] = f"미결제약정 대량 순증 (+{((oi_total / prev_oi - 1) * 100):.1f}%)"
+        return True
+
     return False
 
 
 def record_alert_sent(item: dict):
-    """텔레그램 발송 성공 시에만 캐시 갱신 (24시간 카운트다운 시작)."""
+    """텔레그램 발송 성공 시에만 캐시 갱신 (24시간 카운트다운 및 재알림 기준점 갱신)."""
     sym = item["symbol"]
     alert_cache[sym] = {
         "last_time": time.time(),
-        "score": item["score"],
-        "price": item["price"],
+        "score": item.get("score", 0.0),
+        "price": item.get("price", 0.0),
+        "vol_15m": item.get("vol_15m", 0.0) or 0.0,
+        "squeeze_div": item.get("squeeze_div", 1.0) or 1.0,
+        "oi_total": item.get("oi_total", 0.0) or 0.0,
+        "fund_now": item.get("fund_now", 0.0) or 0.0,
     }
 
 
@@ -134,6 +175,7 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     vx = d["volx"] or 0.0
     v6x = d["vol_6h_x"] or 0.0
     oi_chg = d.get("oi_chg24")
+    oi_total = d.get("oi_total", 0.0)
     prem = d.get("prem_now")
     fund = d.get("fund_now")
 
@@ -150,8 +192,11 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     lsr_retail = d.get("lsr_retail")
     squeeze_div = d.get("squeeze_div")
 
-    # 신호 배지 정밀 분류 (상호 배타적 우선순위)
-    if squeeze_div and squeeze_div >= 1.4 and taker_buy_pct >= 65.0 and ((fund and fund <= 0.0) or (prem and prem < 0.0)):
+    # 신호 배지 정밀 분류 (상호 배타적 우선순위, 2차 재알림 최우선)
+    re_reason = d.get("re_alert_reason")
+    if re_reason:
+        badge = f"🚨 [{re_reason}]"
+    elif squeeze_div and squeeze_div >= 1.4 and taker_buy_pct >= 65.0 and ((fund and fund <= 0.0) or (prem and prem < 0.0)):
         badge = "🔴 [약탈적 숏스퀴즈]"
     elif v15_pct >= 8.0 and taker_buy_pct >= 65.0 and from_high >= -0.15:
         badge = "🟢 [초동 수급 이상방량]"
@@ -169,7 +214,8 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     if taker_buy_pct and taker_buy_pct >= 65.0:
         anomalies.append(f"🔵 <b>시장가 매수 {taker_buy_pct:.1f}%</b> (TIB {tib:+.2f} 공격적 체결)")
     if oi_chg and oi_chg >= 0.30:
-        anomalies.append(f"🟣 <b>24h 미결제약정 {fmt_pct(oi_chg, 1)}</b> (포지션 급증)")
+        oi_tot_badge = f" ({fmt_usd(oi_total)})" if oi_total and oi_total > 0 else ""
+        anomalies.append(f"🟣 <b>24h 미결제약정 {fmt_pct(oi_chg, 1)}{oi_tot_badge}</b> (포지션 급증)")
     if (fund and fund <= -0.005) or (prem and prem <= -0.005):
         anomalies.append(f"🟠 <b>음수 펀딩비 {fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})")
     elif vx and vx >= 10.0 and len(anomalies) < 4:
@@ -196,9 +242,9 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     retail_str = f"<b>{lsr_retail:.2f}</b> (숏 과밀)" if (lsr_retail and lsr_retail < 0.8) else (f"{lsr_retail:.2f}" if lsr_retail else "-")
     whale_str = f"<b>{lsr_whale:.2f}</b> (롱 집중)" if (lsr_whale and lsr_whale > 1.2) else (f"{lsr_whale:.2f}" if lsr_whale else "-")
     div_str = f"<b>{squeeze_div:.2f}배</b>" if squeeze_div else "-"
+    oi_tot_str = f" ({fmt_usd(oi_total)})" if oi_total and oi_total > 0 else ""
 
     msg = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>{badge} {sym}USDT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"종합 점수 : <b>{score:.1f}점</b>\n"
@@ -222,9 +268,8 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         f"• 개미 롱숏(계정) : {retail_str}\n"
         f"• 고래 롱숏(포지션) : {whale_str}\n"
         f"{b_div} 스퀴즈 괴리도 : {div_str}\n"
-        f"{b_oi} 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}</b>\n"
-        f"{b_fund} 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{b_oi} 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}{oi_tot_str}</b>\n"
+        f"{b_fund} 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n\n"
         f"{as_of_str} UTC 봉 마감 기준"
     )
     return msg

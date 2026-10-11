@@ -342,13 +342,14 @@ async def fetch_oi_change(c: Client, symbol: str):
         data = await c.get("/futures/data/openInterestHist", {
             "symbol": symbol, "period": "1h", "limit": 25})
         if not data or len(data) < 2:
-            return None
+            return None, 0.0
         data.sort(key=lambda r: r["timestamp"])
         oi_now = float(data[-1]["sumOpenInterestValue"])
         oi_first = float(data[0]["sumOpenInterestValue"])
-        return oi_now / oi_first - 1 if oi_first > 0 else None
+        oi_chg = (oi_now / oi_first - 1) if oi_first > 0 else None
+        return oi_chg, oi_now
     except Exception:
-        return None
+        return None, 0.0
 
 
 _MCAP_CACHE = {"data": {}, "last_update": 0}
@@ -503,8 +504,13 @@ async def scan_live_candidates(c: Client, args):
             asyncio.gather(*oi_tasks),
             asyncio.gather(*metrics_tasks)
         )
-        for cand, oi_chg, metrics in zip(candidates, oi_results, metrics_results):
-            cand["oi_chg24"] = oi_chg
+        for cand, oi_res, metrics in zip(candidates, oi_results, metrics_results):
+            if isinstance(oi_res, tuple):
+                cand["oi_chg24"] = oi_res[0]
+                cand["oi_total"] = oi_res[1]
+            else:
+                cand["oi_chg24"] = oi_res
+                cand["oi_total"] = 0.0
             cand["vol_15m"] = metrics["vol_15m"]
             cand["vol_1h"] = metrics["vol_1h"]
             cand["taker_buy_pct"] = metrics["taker_buy_pct"]
