@@ -313,6 +313,15 @@ async def live_symbol(c: Client, symbol: str, end_ms: int, now_ms: int,
         if from_high < -0.30:
             return None
 
+        # 윗꼬리(Upper Shadow) 덤프 분석 (Bulkowski 2008)
+        o_i, h_i, l_i, c_i = sr.o[i], sr.h[i], sr.l[i], sr.c[i]
+        hl_range = h_i - l_i
+        upper_shadow = ((h_i - max(o_i, c_i)) / hl_range) if hl_range > 0 else 0.0
+
+        # 심각한 윗꼬리 덤프 (전체 변동폭의 65% 이상을 윗꼬리로 토해낸 음봉 설거지 캔들) 배제
+        if upper_shadow >= 0.65 and c_i < o_i:
+            return None
+
         p_info = prem_map.get(symbol, {})
         prem_now = p_info.get("prem")
         fund_now = p_info.get("fund")
@@ -328,6 +337,8 @@ async def live_symbol(c: Client, symbol: str, end_ms: int, now_ms: int,
             "ret24": ret24,
             "ret72": ret72,
             "from_high": from_high,
+            "upper_shadow": upper_shadow,
+            "is_bull": c_i >= o_i,
             "prem_now": prem_now,
             "fund_now": fund_now,
             "last_t": sr.t[i],
@@ -556,7 +567,17 @@ async def scan_live_candidates(c: Client, args):
             s_oi = max(0.0, oi_val) * 2.0
             s_ret = max(0.0, min(ret24, 0.50)) * 4.0
 
-            cand["score"] = s_vol + s_mcap + s_tib + s_squeeze + s_oi + s_ret
+            # 6. 캔들 건전성 (Bulkowski 2008: 윗꼬리 덤프 감점 / 꽉 찬 장대양봉 가산)
+            ushadow = cand.get("upper_shadow", 0.0)
+            is_bull = cand.get("is_bull", True)
+            if ushadow >= 0.50:
+                s_candle = -2.0  # 윗꼬리 50% 이상 설거지형 감점
+            elif ushadow <= 0.25 and is_bull:
+                s_candle = 1.5   # 윗꼬리 25% 이하 꽉 찬 양봉 가산
+            else:
+                s_candle = 0.0
+
+            cand["score"] = max(0.0, s_vol + s_mcap + s_tib + s_squeeze + s_oi + s_ret + s_candle)
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top_candidates = candidates[:args.top]

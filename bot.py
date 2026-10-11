@@ -146,6 +146,11 @@ def should_alert(item: dict) -> bool:
         item["re_alert_reason"] = f"미결제약정 대량 순증 (+{((oi_total / prev_oi - 1) * 100):.1f}%)"
         return True
 
+    # 5. 횡보 박스권 2차 돌파 (직전 알림가 대비 +6% 이상 상향 돌파 & 15분 거래량 $5M 이상 또는 직전 대비 80% 이상 유입)
+    if prev_price > 0 and price >= prev_price * 1.06 and v15 >= max(prev_v15 * 0.8, 5_000_000):
+        item["re_alert_reason"] = f"박스권 2차 돌파 (+{((price / prev_price - 1) * 100):.1f}%)"
+        return True
+
     return False
 
 
@@ -206,6 +211,7 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         badge = "⚪ [급등 시그널]"
 
     # 특이사항 탐지 및 색상 불릿 요약 블록 생성
+    oi_disp = fmt_usd(oi_total) if (oi_total and oi_total > 0) else "-"
     anomalies = []
     if squeeze_div and squeeze_div >= 1.4:
         anomalies.append(f"🔴 <b>스퀴즈 괴리 {squeeze_div:.2f}배</b> (고래 롱 vs 개미 숏 대립)")
@@ -213,9 +219,8 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         anomalies.append(f"🟢 <b>15분 거래량 시총 {v15_pct:.1f}%</b> ({fmt_usd(v15)} 대량 집중)")
     if taker_buy_pct and taker_buy_pct >= 65.0:
         anomalies.append(f"🔵 <b>시장가 매수 {taker_buy_pct:.1f}%</b> (TIB {tib:+.2f} 공격적 체결)")
-    if oi_chg and oi_chg >= 0.30:
-        oi_tot_badge = f" ({fmt_usd(oi_total)})" if oi_total and oi_total > 0 else ""
-        anomalies.append(f"🟣 <b>24h 미결제약정 {fmt_pct(oi_chg, 1)}{oi_tot_badge}</b> (포지션 급증)")
+    if (oi_total and oi_total >= 10_000_000) or (oi_chg and oi_chg >= 0.30):
+        anomalies.append(f"🟣 <b>총 미결제약정 {oi_disp}</b> (대규모 포지션 집중)")
     if (fund and fund <= -0.005) or (prem and prem <= -0.005):
         anomalies.append(f"🟠 <b>음수 펀딩비 {fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})")
     elif vx and vx >= 10.0 and len(anomalies) < 4:
@@ -229,7 +234,7 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     b_v15 = "🟢" if (v15_pct and v15_pct >= 5.0) else "•"
     b_tib = "🔵" if (taker_buy_pct and taker_buy_pct >= 65.0) else "•"
     b_div = "🔴" if (squeeze_div and squeeze_div >= 1.4) else "•"
-    b_oi = "🟣" if (oi_chg and oi_chg >= 0.30) else "•"
+    b_oi = "🟣" if ((oi_total and oi_total >= 10_000_000) or (oi_chg and oi_chg >= 0.30)) else "•"
     b_fund = "🟠" if ((fund and fund <= -0.005) or (prem and prem <= -0.005)) else "•"
 
     # 시총 관련 텍스트
@@ -242,7 +247,6 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     retail_str = f"<b>{lsr_retail:.2f}</b> (숏 과밀)" if (lsr_retail and lsr_retail < 0.8) else (f"{lsr_retail:.2f}" if lsr_retail else "-")
     whale_str = f"<b>{lsr_whale:.2f}</b> (롱 집중)" if (lsr_whale and lsr_whale > 1.2) else (f"{lsr_whale:.2f}" if lsr_whale else "-")
     div_str = f"<b>{squeeze_div:.2f}배</b>" if squeeze_div else "-"
-    oi_tot_str = f" ({fmt_usd(oi_total)})" if oi_total and oi_total > 0 else ""
 
     ticker_url = f"https://www.binance.com/en/futures/{sym}USDT"
     msg = (
@@ -268,7 +272,7 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
         f"• 개미 롱숏(계정) : {retail_str}\n"
         f"• 고래 롱숏(포지션) : {whale_str}\n"
         f"{b_div} 스퀴즈 괴리도 : {div_str}\n"
-        f"{b_oi} 24h 미결제약정(OI) : <b>{fmt_pct(oi_chg, 1)}{oi_tot_str}</b>\n"
+        f"{b_oi} 총 미결제약정(OI) : <b>{oi_disp}</b>\n"
         f"{b_fund} 최신 펀딩비 : <b>{fmt_pct(fund, 3)}</b> (괴리율 {fmt_pct(prem, 2)})\n\n"
         f"{as_of_str} UTC 봉 마감 기준"
     )
