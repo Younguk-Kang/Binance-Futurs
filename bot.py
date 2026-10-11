@@ -244,9 +244,9 @@ def format_alert_message(d: dict, as_of_str: str) -> str:
     div_str = f"<b>{squeeze_div:.2f}배</b>" if squeeze_div else "-"
     oi_tot_str = f" ({fmt_usd(oi_total)})" if oi_total and oi_total > 0 else ""
 
+    ticker_url = f"https://www.binance.com/en/futures/{sym}USDT"
     msg = (
-        f"<b>{badge} {sym}USDT</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{badge} <a href=\"{ticker_url}\">{sym}USDT</a></b>\n\n"
         f"종합 점수 : <b>{score:.1f}점</b>\n"
         f"현재 가격 : <b>${price:.5g}</b>\n"
         f"\n"
@@ -334,13 +334,11 @@ async def scheduler_loop(args):
     async with aiohttp.ClientSession() as session:
         # 기동 안내 메시지 (토큰 등록 시 1회 발송)
         startup_msg = (
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>[시스템 가동] 바이낸스 선물 급등 스캐너</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>[시스템 가동] 바이낸스 선물 급등 스캐너</b>\n\n"
             f"• 스캔 주기 : {SCAN_INTERVAL_MIN}분\n"
             f"• 24h 최소 거래량 : ${LIVE_MIN_VOL_MILLION:.0f}M (초동 알트코인 포착)\n"
             f"• 최소 점수 : {MIN_SCORE_NOTIFY}점\n"
-            f"• 알림 쿨다운 : {COOLDOWN_HOURS:.0f}시간 (거래량 초기화 대기)\n"
+            f"• 알림 쿨다운 : {COOLDOWN_HOURS:.0f}시간 (특이변화 시 즉시 재알림)\n"
             f"• 감시 상태 : 정상 가동 중"
         )
         await send_telegram(session, startup_msg)
